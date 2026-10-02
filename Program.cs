@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -13,12 +14,13 @@ using static System.Windows.Forms.VisualStyles.VisualStyleElement.Window;
 // https://archive.softwareheritage.org/save/
 
 
-public class QuickLauncher : Form
+public class QuickLauncher : Form, IMessageFilter
 {
 
     static string windowName = "Quick Launcher"; // Should match the titleLabel.Text or Form.Text    
     private NotifyIcon trayIcon;
     private ContextMenuStrip trayMenu;
+    private ToolStripMenuItem idleToggleItem;
 
     private Panel mainPanel;
     private FlowLayoutPanel itemsPanel;
@@ -41,6 +43,36 @@ public class QuickLauncher : Form
 
     // Add a unique message ID for communication between instances
     private const int WM_SHOW_OR_HIDE_LAUNCHER = 0x0401; // Choose a unique value
+
+    // Single-instance IPC: the second instance posts this message to the first
+    // instance's window. The wParam encodes the requested action so the same
+    // hidden window can serve multiple entry points (hotkey, tray, CLI).
+    private const int SHOWMSG_TOGGLE = 0;   // show if hidden / close-or-navigate if visible
+    private const int SHOWMSG_SHOW = 1;     // always show
+    private const int SHOWMSG_EDIT = 2;     // open the editor
+
+    /// <summary>
+    /// Command-line interface (handled by the primary instance):
+    ///   QuickLaunch.exe               -> toggle launcher (same as hotkey)
+    ///   QuickLaunch.exe /show         -> show launcher
+    ///   QuickLaunch.exe /hide         -> hide/close launcher
+    ///   QuickLaunch.exe /edit         -> open the editor
+    /// Unknown args are treated as toggle (legacy behaviour).
+    /// </summary>
+    private static int ShowMessageWParamForArgs(string[] args)
+    {
+        foreach (var raw in args ?? Array.Empty<string>())
+        {
+            var a = raw.TrimStart('/', '-').ToLowerInvariant();
+            switch (a)
+            {
+                case "show": return SHOWMSG_SHOW;
+                case "hide": return SHOWMSG_TOGGLE; // toggles off if visible, shows if hidden
+                case "edit": return SHOWMSG_EDIT;
+            }
+        }
+        return SHOWMSG_TOGGLE;
+    }
 
     // P/Invoke declarations for finding and manipulating the window
     [DllImport("user32.dll", SetLastError = true)]
@@ -68,6 +100,153 @@ public class QuickLauncher : Form
     private const int WM_HOTKEY = 0x0312;
     private const int HOTKEY_ID = 9000; // Choose a unique ID for your hotkey
 
+    // ---------------------------------------------------------------------
+    // Idle process-exiter: quits the app after a configurable period without
+    // any keyboard/mouse interaction (see ActivityMonitor below). The timer
+    // is only ticking while the launcher window is hidden; showing the
+    // launcher always counts as activity and resets it.
+    // ---------------------------------------------------------------------
+    private System.Windows.Forms.Timer idleExitTimer;
+    private bool exitingDueToIdle = false;
+    private bool activityFlagPending = false;   // coalescing flag for the message-filter hook
+
+    public static QuickLauncher Instance { get; private set; }
+
+    /// <summary>
+    /// Win32 LASTINPUTINFO: seconds since the system-wide last input event.
+    /// Used as a safety net so an external process injecting keystrokes into a
+    /// child of this process (e.g. AutoHotkey re-sending SendKeys shortcuts)
+    /// can never trigger the idle auto-exit while the user is at the keyboard.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    private static double SystemIdleAgeMs()
+    {
+        try
+        {
+            var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+            if (!GetLastInputInfo(ref lii)) return -1;
+            return (Environment.TickCount64 - lii.dwTime);
+        }
+        catch { return -1; }
+    }
+
+    private void InitializeIdleExitTimer()
+    {
+        idleExitTimer = new System.Windows.Forms.Timer();
+        // Poll at a fixed cadence; the actual timeout is compared against the
+        // configurable interval inside the Tick handler (see ApplyIdleSettings).
+        idleExitTimer.Interval = IdlePollMs;
+        idleExitTimer.Tick += (s, e) =>
+        {
+            if (!appSettings.AutoExitWhenIdle) return;
+            // Never exit while the window is visible or an item is running.
+            if (this.Visible || stopAutoClose) return;
+
+            double age = ActivityMonitor.LastActivityAgeMs;
+            // Safety net: LASTINPUTINFO reports input that happened *after* our
+            // recorded activity (e.g. keystrokes injected into one of our child
+            // processes by AutoHotkey, which low-level hooks do not observe).
+            // Trust whichever timestamp is more recent.
+            double sysAge = SystemIdleAgeMs();
+            if (sysAge >= 0 && sysAge < age) age = sysAge;
+
+            int timeout = (idleExitTimer.Tag is int tmo) ? tmo : IdleTimeoutMs;
+            if (age < timeout) return;
+
+            exitingDueToIdle = true;
+            idleExitTimer.Stop();
+            Application.Exit();
+        };
+        idleExitTimer.Start();
+    }
+
+    // How often the idle watchdog evaluates the timestamps (independent of the
+    // user-configurable timeout so polling stays cheap and predictable).
+    private const int IdlePollMs = 2000;
+
+    // Recompute the timeout whenever settings change (e.g. editor save / tray toggle).
+    private void ApplyIdleSettings()
+    {
+        if (idleExitTimer == null) return;
+        idleExitTimer.Tag = IdleTimeoutMs;   // effective timeout, checked on each tick
+        idleExitTimer.Enabled = appSettings.AutoExitWhenIdle;
+        UpdateIdleToggleText();
+    }
+
+    // Keep the tray menu item label in sync with the configured timeout.
+    private void UpdateIdleToggleText()
+    {
+        if (idleToggleItem == null) return;
+        idleToggleItem.Text = appSettings.AutoExitWhenIdle
+            ? $"Auto-exit when idle ({appSettings.IdleTimeoutSeconds}s)"
+            : "Auto-exit when idle (off)";
+    }
+
+    private int IdleTimeoutMs
+    {
+        get
+        {
+            var secs = appSettings.IdleTimeoutSeconds;
+            if (secs <= 0) secs = QuickLauncherSettings.DefaultIdleTimeoutSeconds;
+            return secs * 1000;
+        }
+    }
+
+    /// <summary>
+    /// Call this from every keyboard/mouse event that indicates the user is
+    /// interacting with the launcher. It resets the idle-exit countdown and,
+    /// as a safety net, restarts the monitor if a previous Application.Exit
+    /// was cancelled by another open form (e.g. the editor dialog).
+    /// </summary>
+    public static void RecordActivity()
+    {
+        ActivityMonitor.RecordActivity();
+        var inst = Instance;
+        if (inst != null && inst.exitingDueToIdle)
+        {
+            inst.exitingDueToIdle = false;
+            inst.ApplyIdleSettings();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // IMessageFilter: coalesced activity tracking for ALL messages pumped
+    // by this app's message loop (launcher window, editor dialog, tray).
+    // Input messages are frequent, so instead of writing the timestamp on
+    // every single one we set a flag and flush it at most once per 250 ms.
+    // ------------------------------------------------------------------
+    private const int ActivityFlushIntervalMs = 250;
+    private long lastActivityFlushTicks = 0;
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        // WM_KEYDOWN..WM_MOUSELAST covers all keyboard & mouse input messages.
+        if (m.Msg >= 0x0100 && m.Msg <= 0x02FF)
+        {
+            activityFlagPending = true;
+        }
+        else if (activityFlagPending)
+        {
+            activityFlagPending = false;
+            var now = Environment.TickCount64;
+            if (now - lastActivityFlushTicks >= ActivityFlushIntervalMs)
+            {
+                lastActivityFlushTicks = now;
+                RecordActivity();
+            }
+        }
+        return false; // never consume messages
+    }
+
 
     [DllImport("user32.dll")]
     private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, Keys vk);
@@ -89,9 +268,11 @@ public class QuickLauncher : Form
         base.OnLoad(e);
         this.Hide(); // Hide initially
 
-        // Register the global hotkey when the form loads
-        if (appSettings.UseTrayIcon)
-            RegisterGlobalHotkey();
+        // Register the global hotkey when the form loads. The hotkey is what
+        // summons the launcher, so it must work even without the tray icon;
+        // (previously it was gated on UseTrayIcon, which left no way to show
+        // the window when running tray-less).
+        RegisterGlobalHotkey();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -137,13 +318,55 @@ public class QuickLauncher : Form
         showItem.Click += (s, e) => ShowLauncher();
         var editItem = new ToolStripMenuItem("Edit");
         editItem.Click += (s, e) => OpenEditor();
+        var reloadItem = new ToolStripMenuItem("Reload Settings");
+        reloadItem.Click += (s, e) => ReloadSettingsFromDisk();
+        var openFolderItem = new ToolStripMenuItem("Open Settings Folder");
+        openFolderItem.Click += (s, e) => { try { Process.Start("explorer.exe", Path.GetDirectoryName(configPath)); } catch { } };
+
+        // Tray icon on/off toggle (hotkey registration is only active with the tray).
+        var trayToggleItem = new ToolStripMenuItem("Show Tray Icon")
+        {
+            Checked = appSettings.UseTrayIcon,
+            CheckOnClick = true
+        };
+        trayToggleItem.CheckedChanged += (s, e) =>
+        {
+            appSettings.UseTrayIcon = ((ToolStripMenuItem)s).Checked;
+            SaveConfiguration();
+            UpdateTrayVisibility();
+            RefreshGlobalHotkey();
+        };
+
+        // Idle-exit on/off toggle (kept in sync via SettingChanged).
+        idleToggleItem = new ToolStripMenuItem()
+        {
+            Checked = appSettings.AutoExitWhenIdle,
+            CheckOnClick = true
+        };
+        UpdateIdleToggleText();
+        idleToggleItem.CheckedChanged += (s, e) =>
+        {
+            appSettings.AutoExitWhenIdle = ((ToolStripMenuItem)s).Checked;
+            SaveConfiguration();
+            ApplyIdleSettings();
+            RecordActivity(); // toggling counts as usage -> fresh countdown
+        };
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (s, e) => Application.Exit(); // Use Application.Exit() to close the app properly
 
         trayMenu.Items.Add(showItem);
         trayMenu.Items.Add(editItem);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add(trayToggleItem);
+        trayMenu.Items.Add(idleToggleItem);
+        trayMenu.Items.Add(reloadItem);
+        trayMenu.Items.Add(openFolderItem);
         trayMenu.Items.Add(new ToolStripSeparator()); // Optional separator
         trayMenu.Items.Add(exitItem);
+
+        // Refresh dynamic labels (idle timeout text) each time the menu opens.
+        trayMenu.Opening += (s, e) => UpdateIdleToggleText();
 
         trayIcon = new NotifyIcon()
         {
@@ -151,7 +374,7 @@ public class QuickLauncher : Form
             // Icon = new Icon("path/to/your/icon.ico"), // Load a custom icon
             Text = windowName, // Tooltip text
             ContextMenuStrip = trayMenu, // Assign the context menu
-            Visible = true // Make the icon visible immediately when the form starts
+            Visible = false // actual visibility is driven by UpdateTrayVisibility()
         };
 
         // Optional: Double-clicking the tray icon can show the launcher
@@ -160,6 +383,7 @@ public class QuickLauncher : Form
     private int titleBarHeight = 26;
     public QuickLauncher()
     {
+        Instance = this;
 
         // Load configuration
         LoadConfiguration();
@@ -277,10 +501,12 @@ public class QuickLauncher : Form
 
         BuildUI();
 
-        // Handle form events
+        // Handle form events. Any keyboard/mouse interaction with the launcher
+        // counts as activity and resets the idle-exit countdown (RecordActivity).
         this.Deactivate += (s, e) => this.Hide();
         this.KeyPreview = true;
         this.KeyDown += (s, e) => {
+            RecordActivity();
             if (e.KeyCode == Keys.Escape)
             {
                 if (navigationStack.Count > 0)
@@ -300,21 +526,55 @@ public class QuickLauncher : Form
         CenterOnScreen();
         SetWindowPos(this.Handle, new IntPtr(-1), 0, 0, 0, 0, 0x1 | 0x2); // required to prevent app from closing automaticlaly when started if not focused and topmost.
         SetActiveWindow(this.Handle);
+
+        // Install the global mouse/keyboard activity monitor that feeds the
+        // idle-exit timer (low-level hooks + message filter fallback).
+        ActivityMonitor.Install();
+
+        // Coalesced in-app activity tracking for every form/dialog we pump
+        // messages for (also covers the case where the low-level hooks fail).
+        Application.AddMessageFilter(this);
+
+        // Start the idle process-exiter countdown.
+        InitializeIdleExitTimer();
+
         // DEBUG ONLY
         //OpenEditor();
         //System.Environment.Exit(0);
 
-        if (appSettings.UseTrayIcon)
-            InitializeTrayIcon();
+        // The tray icon is always created so the app remains reachable even
+        // when UseTrayIcon is later toggled off/on without a restart; its
+        // visibility is driven by the setting via UpdateTrayVisibility().
+        InitializeTrayIcon();
+        UpdateTrayVisibility();
+    }
+
+    /// <summary>
+    /// Show or hide the tray icon according to <c>appSettings.UseTrayIcon</c>.
+    /// Safe to call before the tray icon exists.
+    /// </summary>
+    private void UpdateTrayVisibility()
+    {
+        if (trayIcon != null)
+            trayIcon.Visible = appSettings.UseTrayIcon;
+    }
+
+    /// <summary>
+    /// Re-register (or unregister) the global hotkey from the current settings.
+    /// </summary>
+    private void RefreshGlobalHotkey()
+    {
+        try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { }
+        try { RegisterGlobalHotkey(); } catch { }
     }
 
 
     private void CloseOrHide()
     {
-
+        RecordActivity(); // hiding via user action is still "usage"
         this.Hide();
         if (!appSettings.UseTrayIcon)
-            this.Close();
+            Application.Exit(); // no tray to live in -> same shutdown as idle-exit
     }
 
 
@@ -348,6 +608,21 @@ public class QuickLauncher : Form
         {
             CreateDefaultConfiguration();
         }
+    }
+
+    /// <summary>
+    /// Re-read the settings file from disk and rebuild the UI. Handy if you
+    /// edit QuickLauncherSettings.xml by hand (or with another tool) without
+    /// going through the editor.
+    /// </summary>
+    private void ReloadSettingsFromDisk()
+    {
+        navigationStack.Clear();
+        LoadConfiguration();
+        BuildUI();
+        ApplyIdleSettings();
+        UpdateTrayVisibility();
+        RefreshGlobalHotkey();
     }
 
     private void SaveConfiguration()
@@ -395,6 +670,7 @@ public class QuickLauncher : Form
 
     public void ShowLauncher()
     {        
+        RecordActivity(); // summoning the launcher counts as usage
         FixStack();
         CenterOnScreen();
         this.Show();
@@ -485,7 +761,7 @@ public class QuickLauncher : Form
 
             btn.FlatAppearance.BorderSize = 0;
 
-            btn.Click += (s, e) => ExecuteItem((QuickItem)((Button)s).Tag, (ModifierKeys == Keys.Control) ? QuickItemType.App : ((ModifierKeys == Keys.Shift) ? QuickItemType.Command : null));
+            btn.Click += (s, e) => { RecordActivity(); ExecuteItem((QuickItem)((Button)s).Tag, (ModifierKeys == Keys.Control) ? QuickItemType.App : ((ModifierKeys == Keys.Shift) ? QuickItemType.Command : null)); };
             btn.KeyDown += ButtonKeyDown;
             btn.MouseEnter += (s, e) => {
                 var btn = (Button)s;
@@ -493,6 +769,7 @@ public class QuickLauncher : Form
                 btn.BackColor = item.FontColor;
                 ((Button)s).Focus();
             };
+            btn.MouseDown += (s, e) => RecordActivity(); // mouse interaction resets idle-exit timer
             btn.MouseLeave += (s, e) =>
             {
                 var btn = (Button)s;
@@ -528,6 +805,7 @@ public class QuickLauncher : Form
 
     private void ExecuteItem(QuickItem item, QuickItemType? forceType = null)
     {
+        RecordActivity();
         var type = (forceType.HasValue) ? forceType.Value : item.Type;
         var path = item.Path;
         var args = item.Args;
@@ -584,9 +862,29 @@ public class QuickLauncher : Form
                 }
                 break;
             case QuickItemType.Shortcut:
-                SendKeys.SendWait(item.Path);
+                // SendKeys targets the foreground window, so the launcher must
+                // be hidden first or it would receive its own keystrokes.
+                this.Hide();
+                System.Threading.Thread.Sleep(50); // let activation settle
+                try { SendKeys.SendWait(item.Path); }
+                catch (Exception ex) { MessageBox.Show($"Error sending keys: {ex.Message}"); }
                 if (item.Close)
                     CloseOrHide();
+                else
+                    this.Show();
+                break;
+            case QuickItemType.GlobalShortcut:
+                // Synthesize a system-wide key combo via keybd_event. The Path
+                // holds the combo with modifiers (e.g. "Ctrl+Alt+Delete",
+                // "Win+D"); Args is unused.
+                this.Hide(); // give the foreground to whatever receives it
+                System.Threading.Thread.Sleep(50);
+                try { SendGlobalShortcut(item.Path); }
+                catch (Exception ex) { MessageBox.Show($"Error sending global shortcut: {ex.Message}"); }
+                if (item.Close)
+                    CloseOrHide();
+                else
+                    this.Show();
                 break;
             case QuickItemType.Folder:
                 navigationStack.Push(item);
@@ -595,11 +893,68 @@ public class QuickLauncher : Form
             case QuickItemType.Task:
                 type = QuickItemType.App;
                 path = "C:\\Windows\\System32\\schtasks.exe";
-                args = "/Run /TN \"" + item.TaskName + "\"";
+                // Quote the task name too so names with spaces/special chars are safe.
+                args = "/Run /TN \"" + (item.TaskName ?? "").Replace("\"", "\\\"") + "\"";
                 workingDir = "";
                 goto top;
                 break;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // GlobalShortcut support: parse a combo string like "Ctrl+Alt+F1" or
+    // "Win+D" into VK codes and inject it system-wide with keybd_event.
+    // ------------------------------------------------------------------
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+
+    private static Keys? ParseShortcutToken(string token)
+    {
+        token = token.Trim();
+        switch (token.ToLowerInvariant())
+        {
+            case "ctrl": case "control": return Keys.Control;
+            case "alt": case "menu": return Keys.Alt;
+            case "shift": return Keys.Shift;
+            case "win": case "windows": return Keys.LWin;
+        }
+        if (token.Length == 1)
+        {
+            char c = char.ToUpperInvariant(token[0]);
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (Keys)c;
+        }
+        if (Enum.TryParse<Keys>(token, true, out var parsed)) return parsed;
+        return null;
+    }
+
+    private static void SendGlobalShortcut(string combo)
+    {
+        if (string.IsNullOrWhiteSpace(combo)) return;
+        var parts = combo.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
+        var mods = new List<Keys>();
+        Keys main = Keys.None;
+        foreach (var p in parts)
+        {
+            var k = ParseShortcutToken(p);
+            if (k == null) continue;
+            var kk = k.Value;
+            if (kk == Keys.Control || kk == Keys.Alt || kk == Keys.Shift || kk == Keys.LWin || kk == Keys.RWin)
+                mods.Add(kk);
+            else
+                main = kk;
+        }
+        if (main == Keys.None) return;
+
+        void Tap(Keys vk, bool down) =>
+            keybd_event((byte)vk, 0, (down ? 0u : KEYEVENTF_KEYUP) | (((uint)vk & 0xF0) == 0x70 ? KEYEVENTF_EXTENDEDKEY : 0), UIntPtr.Zero);
+
+        foreach (var m in mods) Tap(m, true);
+        Tap(main, true);
+        Tap(main, false);
+        for (int i = mods.Count - 1; i >= 0; i--) Tap(mods[i], false);
     }
 
     private void ExecuteCommand(QuickItem item)
@@ -644,6 +999,7 @@ public class QuickLauncher : Form
 
     private void ButtonKeyDown(object sender, KeyEventArgs e)
     {
+        RecordActivity(); // keyboard interaction resets idle-exit timer
         var btn = (Button)sender;
         var item = (QuickItem)btn.Tag;
         var idx = itemsPanel.Controls.IndexOf(btn);
@@ -694,6 +1050,8 @@ public class QuickLauncher : Form
     // Inside the QuickLauncher class
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        RecordActivity(); // any key reaching the launcher counts as usage
+
         // Check for Ctrl+Shift+L to open editor
         if (keyData == (Keys.Control | Keys.Shift | Keys.L))
         {
@@ -701,10 +1059,14 @@ public class QuickLauncher : Form
             return true;
         }
 
-        // Handle shortcut keys in current view
+        // Handle shortcut keys in current view. Strip modifier-only noise so
+        // plain-key shortcuts still match when e.g. Shift is held for letters.
         foreach (var item in currentItems.Items)
         {
-            if (item.ShortcutKey == keyData)
+            if (item.ShortcutKey == Keys.None) continue;
+            if (item.ShortcutKey == keyData ||
+                ((item.ShortcutKey & Keys.KeyCode) == (keyData & Keys.KeyCode) &&
+                 (item.ShortcutKey & Keys.Modifiers) == Keys.None))
             {
                 ExecuteItem(item);
                 return true;
@@ -716,6 +1078,10 @@ public class QuickLauncher : Form
 
     protected override void WndProc(ref Message m)
     {
+        // Any input message that reaches this window (WM_KEY*, WM_MOUSE*, wheel, etc.)
+        // counts as usage and resets the idle-exit countdown. Cheap timestamp write.
+        if (m.Msg >= 0x0100 && m.Msg <= 0x02FF) RecordActivity();
+
         const int WM_ACTIVATEAPP = 0x1C;
         if (m.Msg == WM_ACTIVATEAPP)
         {
@@ -733,6 +1099,7 @@ public class QuickLauncher : Form
             int id = m.WParam.ToInt32();
             if (id == HOTKEY_ID)
             {
+                RecordActivity(); // pressing the hotkey is user interaction
                 if (this.Visible)
                 {
                     CloseOrHide();
@@ -745,10 +1112,25 @@ public class QuickLauncher : Form
             }
         }
 
-        // Handle the custom message from another instance
+        // Handle the custom message from another instance (wParam = requested verb)
         if (m.Msg == WM_SHOW_OR_HIDE_LAUNCHER)
         {
-            // Toggle visibility based on current state
+            int verb = m.WParam.ToInt32();
+
+            if (verb == SHOWMSG_EDIT)
+            {
+                if (!this.Visible) ShowLauncher();
+                OpenEditor();
+                return;
+            }
+
+            if (verb == SHOWMSG_SHOW && !this.Visible)
+            {
+                ShowLauncher();
+                return;
+            }
+
+            // Toggle visibility based on current state (SHOWMSG_TOGGLE, or legacy behaviour)
             if (this.Visible)
             {
                 if (appSettings.closeInsteadOfNavigate)
@@ -786,6 +1168,8 @@ public class QuickLauncher : Form
         if ((registeredHotkey & Keys.Control) == Keys.Control) modifiers |= 0x0002;
         if ((registeredHotkey & Keys.Alt) == Keys.Alt) modifiers |= 0x0001;
         if ((registeredHotkey & Keys.Shift) == Keys.Shift) modifiers |= 0x0004;
+        // MOD_NOREPEAT (0x4000): don't let auto-repeat re-trigger the toggle.
+        modifiers |= 0x4000;
         // Note: Windows key is 0x0008, but requires special handling and might conflict
 
         Keys key = registeredHotkey & ~Keys.Control & ~Keys.Alt & ~Keys.Shift; // Get the main key
@@ -866,8 +1250,12 @@ public class QuickLauncher : Form
     }
 
     private bool stopAutoClose = false;
+    // Public wrapper used by the Shown event handler (CLI "/edit" verb).
+    public void OpenEditorViaShown() => OpenEditor();
+
     private void OpenEditor()
     {
+        RecordActivity(); // opening the editor counts as usage
         stopAutoClose = true;
         this.Hide(); // Hide the launcher while editing                        
         var editor = new QuickLauncherEditor(appSettings, navigationStack);
@@ -894,10 +1282,13 @@ public class QuickLauncher : Form
 
             try
             {
-                if (appSettings.UseTrayIcon)
-                    RegisterGlobalHotkey();
+                RegisterGlobalHotkey(); // hotkey may have changed in the editor
             }
             catch { }
+
+            // Tray visibility / idle-exit settings changed in the editor take effect immediately.
+            UpdateTrayVisibility();
+            ApplyIdleSettings();
         }
 
         BuildUI();
@@ -927,7 +1318,8 @@ public class QuickLauncher : Form
                 if (existingWindowHandle != IntPtr.Zero)
                 {
                     // Send the custom message to the existing instance
-                    bool messageSent = PostMessage(existingWindowHandle, WM_SHOW_OR_HIDE_LAUNCHER, IntPtr.Zero, IntPtr.Zero);
+                    int verb = ShowMessageWParamForArgs(args);
+                    bool messageSent = PostMessage(existingWindowHandle, WM_SHOW_OR_HIDE_LAUNCHER, (IntPtr)verb, IntPtr.Zero);
 
                     if (messageSent)
                     {
@@ -958,6 +1350,12 @@ public class QuickLauncher : Form
             Application.SetCompatibleTextRenderingDefault(false);
             var form = new QuickLauncher(); // Pass true for primary instance
             form.Text = windowName;
+            // If launched with a verb (e.g. "QuickLaunch.exe /edit"), honour it right away.
+            int verb = ShowMessageWParamForArgs(args);
+            if (verb == SHOWMSG_EDIT)
+                form.Shown += (s, e) => form.OpenEditorViaShown();
+            else if (verb == SHOWMSG_SHOW)
+                form.Shown += (s, e) => form.ShowLauncher();
             Application.Run(form);
 
             // The 'using' statement ensures the mutex is released when the application exits
@@ -969,9 +1367,10 @@ public class QuickLauncher : Form
     {
         if (disposing)
         {
-            // Unregister the hotkey when the application closes
+            // Unregister the hotkey and activity hooks when the application closes
             try
             {
+                ActivityMonitor.Uninstall();
                 UnregisterHotKey(this.Handle, HOTKEY_ID);
 
                 trayIcon?.Dispose();
@@ -991,9 +1390,17 @@ public class QuickLauncher : Form
 public class QuickLauncherSettings
 {
 
+    public const int DefaultIdleTimeoutSeconds = 60;
+
     public Keys GlobalHotkey { get; set; } = Keys.Control | Keys.Alt | Keys.L;
     public bool UseTrayIcon { get; set; } = false;
     public bool closeInsteadOfNavigate { get; set; } = false; // Specifies that the app will close rather than navigate up the stack to top and then closed when called. 
+
+    // --- Idle process-exiter ---
+    // When enabled, the app quits itself after it has been hidden AND there has
+    // been no keyboard/mouse interaction with the launcher for IdleTimeoutSeconds.
+    public bool AutoExitWhenIdle { get; set; } = true;
+    public int IdleTimeoutSeconds { get; set; } = DefaultIdleTimeoutSeconds;
 
     public QuickItemCollection Items { get; set; } = new QuickItemCollection();
 }
@@ -1135,3 +1542,117 @@ public class QuickItem : QuickItemCollection
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// ActivityMonitor: tracks the timestamp of the last user keyboard/mouse
+// interaction using low-level global hooks (WH_KEYBOARD_LL / WH_MOUSE_LL).
+// The QuickLauncher idle-exit timer consults LastActivityAgeMs to decide
+// whether the app has been unused long enough to quit.
+//
+// Design notes:
+//  * Hooks are installed once at startup and uninstalled on form disposal.
+//  * Callbacks only write a tick count (Interlocked.Exchange) - they never
+//    allocate, block, or touch UI, which keeps hook latency minimal.
+//  * If hook installation fails for any reason, we degrade gracefully:
+//    QuickLauncher still records activity from its own WndProc/events, so the
+//    exit timer works based on in-app usage alone.
+// ---------------------------------------------------------------------------
+public static class ActivityMonitor
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_MBUTTONDOWN = 0x0207;
+    private const int WM_MOUSEWHEEL = 0x020A;
+
+    private delegate IntPtr LowLevelHookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    // Keep references alive so the delegates are not garbage collected.
+    private static LowLevelHookProc kbProc;
+    private static LowLevelHookProc msProc;
+    private static IntPtr kbHook = IntPtr.Zero;
+    private static IntPtr msHook = IntPtr.Zero;
+
+    private static long lastActivityTicks = DateTime.UtcNow.Ticks;
+
+    /// <summary>Milliseconds elapsed since the last recorded activity.</summary>
+    public static double LastActivityAgeMs =>
+        (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityTicks)) * 1000.0 / TimeSpan.TicksPerMillisecond;
+
+    public static void RecordActivity()
+    {
+        Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
+    }
+
+    public static void Install()
+    {
+        try
+        {
+            if (kbHook == IntPtr.Zero)
+            {
+                kbProc = KeyboardHookCallback;
+                kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, kbProc, GetModuleHandle(null), 0);
+            }
+            if (msHook == IntPtr.Zero)
+            {
+                msProc = MouseHookCallback;
+                msHook = SetWindowsHookEx(WH_MOUSE_LL, msProc, GetModuleHandle(null), 0);
+            }
+        }
+        catch
+        {
+            // Hooking failed - fall back to in-app event tracking only.
+        }
+    }
+
+    public static void Uninstall()
+    {
+        try
+        {
+            if (kbHook != IntPtr.Zero) { UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero; }
+            if (msHook != IntPtr.Zero) { UnhookWindowsHookEx(msHook); msHook = IntPtr.Zero; }
+        }
+        catch { }
+    }
+
+    private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int msg = (int)(long)wParam;
+            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                RecordActivity();
+        }
+        return CallNextHookEx(kbHook, nCode, wParam, lParam);
+    }
+
+    private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int msg = (int)(long)wParam;
+            // Button clicks & wheel only (not raw movement): moving the mouse
+            // across the screen without clicking should NOT keep the app alive.
+            if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+                msg == WM_MBUTTONDOWN || msg == WM_MOUSEWHEEL)
+                RecordActivity();
+        }
+        return CallNextHookEx(msHook, nCode, wParam, lParam);
+    }
+}
